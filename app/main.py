@@ -1,102 +1,69 @@
-import os
-from typing import Generator
+from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, HTTPException
-from pydantic import BaseModel, Field
-from sqlalchemy import create_engine, String, Integer, select
-from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
+from fastapi import FastAPI
 
-APP_NAME = os.getenv("APP_NAME", "Cloud DR Demo API")
-APP_VERSION = os.getenv("APP_VERSION", "1.0.0")
-AWS_REGION = os.getenv("AWS_REGION", "local")
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./cloud_dr.db")
+from app.config import APP_NAME, APP_VERSION
+from app.database import Base, engine
 
-connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
-engine = create_engine(DATABASE_URL, connect_args=connect_args)
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+# Import models so SQLAlchemy creates the tables
+import app.models
+
+# Import routers
+from app.routes.health import router as health_router
+from app.routes.users import router as users_router
+from app.routes.backup import router as backup_router
+from app.routes.failure import router as failure_router
+from app.routes.restore import router as restore_router
+from app.routes.metrics import router as metrics_router
+from app.routes.auth import router as auth_router
+
+# Import scheduler
+from app.scheduler import start_scheduler, stop_scheduler
 
 
-class Base(DeclarativeBase):
-    pass
-
-
-class User(Base):
-    __tablename__ = "users"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
-    name: Mapped[str] = mapped_column(String(100), nullable=False)
-    email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
-
+# =====================================================
+# Create database tables
+# =====================================================
 
 Base.metadata.create_all(bind=engine)
 
 
-class UserCreate(BaseModel):
-    name: str = Field(min_length=1, max_length=100)
-    email: str = Field(min_length=3, max_length=255)
+# =====================================================
+# Application Lifespan
+# =====================================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+
+    # Start automatic backup scheduler
+    start_scheduler()
+
+    yield
+
+    # Stop scheduler when application shuts down
+    stop_scheduler()
 
 
-class UserResponse(BaseModel):
-    id: int
-    name: str
-    email: str
-
-    model_config = {"from_attributes": True}
-
+# =====================================================
+# Create FastAPI app
+# =====================================================
 
 app = FastAPI(
     title=APP_NAME,
     version=APP_VERSION,
-    description="Demo API for a cloud-native multi-region disaster recovery project.",
+    description="Cloud Disaster Recovery Platform",
+    lifespan=lifespan
 )
 
 
-def get_db() -> Generator[Session, None, None]:
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+# =====================================================
+# Register Routers
+# =====================================================
 
-
-@app.get("/")
-def root():
-    return {
-        "application": APP_NAME,
-        "version": APP_VERSION,
-        "region": AWS_REGION,
-        "status": "running",
-    }
-
-
-@app.get("/health")
-def health():
-    return {"status": "healthy", "region": AWS_REGION}
-
-
-@app.get("/status")
-def status():
-    return {
-        "application": APP_NAME,
-        "version": APP_VERSION,
-        "region": AWS_REGION,
-        "status": "healthy",
-    }
-
-
-@app.get("/users", response_model=list[UserResponse])
-def list_users(db: Session = Depends(get_db)):
-    return db.scalars(select(User).order_by(User.id)).all()
-
-
-@app.post("/users", response_model=UserResponse, status_code=201)
-def create_user(user: UserCreate, db: Session = Depends(get_db)):
-    existing = db.scalar(select(User).where(User.email == user.email))
-    if existing:
-        raise HTTPException(status_code=409, detail="A user with this email already exists.")
-
-    new_user = User(name=user.name, email=user.email)
-    db.add(new_user)
-    db.commit()
-    db.refresh(new_user)
-    return new_user
+app.include_router(health_router)
+app.include_router(users_router)
+app.include_router(backup_router)
+app.include_router(failure_router)
+app.include_router(restore_router)
+app.include_router(metrics_router)
+app.include_router(auth_router)
